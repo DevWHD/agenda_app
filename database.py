@@ -14,6 +14,9 @@ load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL')
 
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL não está configurada. Configure a variável de ambiente DATABASE_URL")
+
 # Criar engine com otimizações
 engine = create_engine(
     DATABASE_URL,
@@ -21,9 +24,14 @@ engine = create_engine(
     max_overflow=30,                       # Aumentado para picos de tráfego
     pool_pre_ping=True,                    # Verifica conexão antes de usar
     pool_recycle=3600,                     # Recicla conexões a cada 1 hora
+    pool_timeout=30,                       # Timeout ao obter conexão
     echo=False,
     connect_args={
-        'connect_timeout': 10             # Timeout de 10 segundos
+        'connect_timeout': 10,             # Timeout de 10 segundos
+        'keepalives': 1,                   # Ativa keep-alive
+        'keepalives_idle': 30,             # Envia keep-alive a cada 30s de inatividade
+        'keepalives_interval': 10,         # Intervalo entre keep-alives
+        'keepalives_count': 5              # Número de keep-alives antes de dar up
     }
 )
 
@@ -174,6 +182,40 @@ def get_db():
     try:
         yield db
     finally:
+        db.close()
+
+
+def verificar_conexao_banco() -> bool:
+    """Verifica se a conexão com o banco está ok"""
+    try:
+        db = SessionLocal()
+        db.execute('SELECT 1')
+        db.close()
+        return True
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Erro ao conectar no banco de dados: {e}")
+        return False
+
+
+def executar_com_retry(funcao, max_tentativas=3):
+    """Executa uma função com retry em caso de erro de conexão"""
+    import time
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    for tentativa in range(max_tentativas):
+        try:
+            return funcao()
+        except Exception as e:
+            if tentativa < max_tentativas - 1:
+                tempo_espera = 2 ** tentativa  # Exponential backoff
+                logger.warning(f"Erro na tentativa {tentativa + 1}/{max_tentativas}: {e}. Tentando novamente em {tempo_espera}s...")
+                time.sleep(tempo_espera)
+            else:
+                logger.error(f"Falha após {max_tentativas} tentativas: {e}")
+                raise
         db.close()
 
 

@@ -4,10 +4,29 @@ Usa SQLAlchemy ORM para PostgreSQL
 """
 from datetime import datetime, timedelta, date, time
 from typing import List, Dict, Tuple, Optional
-from database import SessionLocal, Profissional, Procedimento, Agendamento, Feriado, HorarioFuncionamento
+from database import SessionLocal, Profissional, Procedimento, Agendamento, Feriado, HorarioFuncionamento, executar_com_retry
 import logging
+import time
 
 logger = logging.getLogger(__name__)
+
+
+def com_retry(funcao):
+    """Decorator para executar funcoes com retry automático"""
+    def wrapper(*args, **kwargs):
+        max_tentativas = 3
+        for tentativa in range(max_tentativas):
+            try:
+                return funcao(*args, **kwargs)
+            except Exception as e:
+                if tentativa < max_tentativas - 1:
+                    tempo_espera = 2 ** tentativa
+                    logger.warning(f"Erro em {funcao.__name__} (tentativa {tentativa + 1}): {e}. Tentando novamente em {tempo_espera}s...")
+                    time.sleep(tempo_espera)
+                else:
+                    logger.error(f"Falha após {max_tentativas} tentativas em {funcao.__name__}: {e}")
+                    raise
+    return wrapper
 
 
 class AgendaManagerDB:
@@ -30,24 +49,33 @@ class AgendaManagerDB:
             }
         }
 
+    @com_retry
     def obter_profissional(self, prof_id: int) -> Optional[Dict]:
         """Obtém detalhes de uma profissional"""
         db = SessionLocal()
         try:
             prof = db.query(Profissional).filter(Profissional.id == prof_id).first()
             return prof.to_dict() if prof else None
+        except Exception as e:
+            logger.error(f"Erro ao obter profissional {prof_id}: {e}")
+            raise
         finally:
             db.close()
 
+    @com_retry
     def obter_profissionais_lista(self) -> List[Dict]:
         """Retorna lista de profissionais"""
         db = SessionLocal()
         try:
             profs = db.query(Profissional).filter(Profissional.ativo == True).all()
             return [p.to_dict() for p in profs]
+        except Exception as e:
+            logger.error(f"Erro ao obter lista de profissionais: {e}")
+            raise
         finally:
             db.close()
 
+    @com_retry
     def obter_procedimentos_profissional(self, prof_id: int) -> Dict:
         """Obtém procedimentos de uma profissional como dicionário"""
         db = SessionLocal()
@@ -62,9 +90,13 @@ class AgendaManagerDB:
                 resultado[proc.codigo] = {
                     'nome': proc.nome,
                     'descricao': proc.descricao,
-                    'duracao_minutos': proc.duracao_minutos
+                    'duracao_minutos': proc.duracao_minutos,
+                    'preco': proc.preco
                 }
             return resultado
+        except Exception as e:
+            logger.error(f"Erro ao obter procedimentos da profissional {prof_id}: {e}")
+            raise
         finally:
             db.close()
 
@@ -78,17 +110,26 @@ class AgendaManagerDB:
                     Feriado.data == date(2026, int(mes), int(dia))
                 ).first()
                 return feriado is not None
+            except Exception as e:
+                logger.error(f"Erro ao verificar feriado para {data_str}: {e}")
+                return False
             finally:
                 db.close()
-        except:
+        except ValueError as e:
+            logger.warning(f"Data com formato inválido: {data_str}")
+            return False
+        except Exception as e:
+            logger.error(f"Erro inesperado ao verificar feriado: {e}")
             return False
 
+    @com_retry
     def gerar_datas_disponiveis(self, prof_id: int, dias_futuros: int = 30) -> List[str]:
         """Gera lista de datas disponíveis para agendamento"""
         db = SessionLocal()
         try:
             prof = db.query(Profissional).filter(Profissional.id == prof_id).first()
             if not prof:
+                logger.warning(f"Profissional {prof_id} não encontrada")
                 return []
 
             datas = []
@@ -111,21 +152,27 @@ class AgendaManagerDB:
                 datas.append(data_str)
 
             return sorted(datas[:30])
+        except Exception as e:
+            logger.error(f"Erro ao gerar datas disponíveis para profissional {prof_id}: {e}")
+            raise
         finally:
             db.close()
 
+    @com_retry
     def gerar_horarios_disponiveis(self, prof_id: int, data_str: str, proc_id: int) -> List[str]:
         """Gera horários disponíveis para um dia e procedimento específicos"""
         db = SessionLocal()
         try:
             prof = db.query(Profissional).filter(Profissional.id == prof_id).first()
             if not prof:
+                logger.warning(f"Profissional {prof_id} não encontrada")
                 return []
 
             try:
                 dia, mes, ano = data_str.split('/')
                 data = date(int(ano), int(mes), int(dia))
-            except:
+            except ValueError as e:
+                logger.warning(f"Data com formato inválido: {data_str}")
                 return []
 
             # Obter horário de funcionamento do dia
@@ -135,6 +182,7 @@ class AgendaManagerDB:
             ).first()
 
             if not horario_func or not horario_func.hora_abertura or not horario_func.hora_fechamento:
+                logger.warning(f"Horário de funcionamento não encontrado para {dia_semana}")
                 return []
 
             # Obter agendamentos do dia
@@ -161,9 +209,13 @@ class AgendaManagerDB:
                 hora_atual += timedelta(minutes=30)
 
             return horarios
+        except Exception as e:
+            logger.error(f"Erro ao gerar horários para profissional {prof_id} em {data_str}: {e}")
+            raise
         finally:
             db.close()
 
+    @com_retry
     def obter_agendamentos_profissional(self, prof_id: int) -> Dict:
         """Obtém agendamentos de uma profissional"""
         db = SessionLocal()
@@ -188,9 +240,13 @@ class AgendaManagerDB:
                     for a in agendamentos
                 ]
             }
+        except Exception as e:
+            logger.error(f"Erro ao obter agendamentos da profissional {prof_id}: {e}")
+            raise
         finally:
             db.close()
 
+    @com_retry
     def criar_agendamento(self, prof_id: int, data_str: str, horario: str, 
                          cliente_nome: str, cliente_telefone: str, 
                          procedimento_id: int, procedimento_nome: str) -> Tuple[bool, str, Optional[str]]:
@@ -231,7 +287,8 @@ class AgendaManagerDB:
 
             db.add(agendamento)
             db.commit()
-
+            
+            logger.info(f"Agendamento criado: {codigo}")
             return True, "Agendamento criado com sucesso", codigo
         except Exception as e:
             db.rollback()
@@ -240,6 +297,7 @@ class AgendaManagerDB:
         finally:
             db.close()
 
+    @com_retry
     def cancelar_agendamento(self, agendamento_id: int) -> Tuple[bool, str]:
         """Cancela um agendamento"""
         db = SessionLocal()
@@ -250,13 +308,17 @@ class AgendaManagerDB:
 
             agend.status = 'cancelado'
             db.commit()
+            
+            logger.info(f"Agendamento {agendamento_id} cancelado")
             return True, "Agendamento cancelado com sucesso"
         except Exception as e:
             db.rollback()
+            logger.error(f"Erro ao cancelar agendamento {agendamento_id}: {e}")
             return False, f"Erro ao cancelar: {str(e)}"
         finally:
             db.close()
 
+    @com_retry
     def obter_dashboard(self) -> Dict:
         """Obtém dados para dashboard"""
         db = SessionLocal()
@@ -284,6 +346,9 @@ class AgendaManagerDB:
                 dados['total_agendamentos'] += len(agendamentos)
 
             return dados
+        except Exception as e:
+            logger.error(f"Erro ao obter dashboard: {e}")
+            raise
         finally:
             db.close()
 
